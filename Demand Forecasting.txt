@@ -1,0 +1,268 @@
+-----------------------Setup a Databricks cluster -----------------------------------------
+
+1. start the cluster 
+
+------------------ Enrich the data by joining the datasets to get complete view of the sales transaction------
+
+joinedData = spark.sql("""
+  select t.timestamp, t.transaction, t.DATE, 
+  l.locationid, l.name as location_name, l.address, l.city, l.state, l.zipcode, l.latitude, l.longitude,
+  m.SKU, m.Name as menu_name 
+  from transactions t
+    join locations l
+      on t.locationid = l.locationid
+    join menu m
+      on t.SKU = m.SKU
+ """)
+
+-----------------------------Persist the results to Disk---------------------------
+
+------------------------Explore demand forecast Data by capturing transaction into a Table and Analyze Data---------------
+
+select state, count(*) from locations group by state order by count(*)
+
+---------------------------Demand By Store----------------------------------------------
+
+
+import com.esri.core.geometry._
+
+def isWithinBounds(point: Seq[Double], bounds: Seq[Seq[Double]]): Boolean = {
+  val _point = new Point(point(0), point(1))
+  
+  val _bounds = new Polygon()
+  _bounds.startPath(bounds(0)(0), bounds(0)(1))
+  _bounds.lineTo(bounds(1)(0), bounds(1)(1))
+  _bounds.lineTo(bounds(2)(0), bounds(2)(1))
+  _bounds.lineTo(bounds(3)(0), bounds(3)(1))
+  
+  OperatorWithin.local().execute(_point, _bounds, SpatialReference.create("WGS84"), null)
+}
+
+val isWithin = udf(isWithinBounds(_: Seq[Double], _: Seq[Seq[Double]]))
+
+import org.apache.spark.sql.expressions._
+import org.apache.spark.sql.functions._
+
+val boundingBox1 = ("NYC", Array(Array(-74.431, 40.293), Array(-74.431, 41.286), Array(-72.276, 40.293), Array(-72.276, 41.286)))
+val boundingBox2 = ("Baltimore/DC", Array(Array(-76.686, 38.335), Array(-76.686, 39.47), Array(-76.0, 38.335), Array(-76.0, 39.47)))
+
+val bounds = sc.parallelize(Seq(boundingBox1, boundingBox2)).toDF("name", "bounds")
+
+val boundingBox = bounds.filter($"name" === "NYC").select($"bounds").collect().head.getAs[Seq[Seq[Double]]](0)
+
+val withVoyage2 = spark.sql(s""" select locationid, longitude, latitude, count(*) as weight from sales group by locationid, longitude, latitude """)
+val points = withVoyage2.select($"longitude".as("lng"), $"latitude".as("lat")).toJSON.collect().mkString(", ")
+val weight = withVoyage2.select($"weight".as("weight")).toJSON.collect().mkString(", ")
+
+val ne = s"{lng: ${boundingBox(3)(0)}, lat: ${boundingBox(3)(1)}}"
+val sw = s"{lng: ${boundingBox(0)(0)}, lat: ${boundingBox(0)(1)}}"
+
+
+displayHTML(s"""<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="initial-scale=1.0">
+    <meta charset="utf-8">
+    <style>
+       body {
+         margin: 4px;
+       }
+       #map {
+        width: 1100px;
+        height: 500px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <script>
+      function initMap() {
+        var map = new google.maps.Map(document.getElementById('map'), {
+          zoom: 8
+        });
+        
+        map.fitBounds(new google.maps.LatLngBounds($sw, $ne))
+        
+        var infowindow = new google.maps.InfoWindow();
+        
+        map.addListener('click', function() {
+          infowindow.close()
+        });
+        
+        map.data.setStyle(function(feature) {
+          var color = 'gray';
+          return ({
+            icon: null,
+            fillColor: color,
+            strokeColor: color,
+            strokeWeight: 2
+          });
+        });        
+        
+        map.data.addListener('click', function(event) {
+          infowindow.close();
+          var myHTML = 'foo';
+          infowindow.setContent("<div style='width:150px; text-align: center;'>"+myHTML+"</div>");
+          infowindow.setPosition(event.feature.getGeometry().get());
+          infowindow.setOptions({pixelOffset: new google.maps.Size(0,-30)});
+          infowindow.open(map);          
+        }); 
+        
+        var heatmap = new google.maps.visualization.HeatmapLayer({
+          data: [$points].map(function(i) { return {location: new google.maps.LatLng(i),weight: 1
+          }; })
+        });
+        
+        heatmap.setMap(map);
+        heatmap.set('opacity', 1.0);
+      }
+    </script>
+    <script async defer
+    src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBziwAG-zzHVG8a0-Q6fUA5gopVBQemJxo&callback=initMap&libraries=visualization">
+    </script>
+  </body>
+</html>""")
+
+
+---------------------------Visualization - (Demand Distribution - All Products)--------------------------------------
+
+select a.locationid,a.SKU,b.name,a.sale
+  from (
+      select locationid,SKU,count(*) as sale 
+        from sales 
+        group by locationid,SKU 
+        order by locationid,SKU asc) a 
+  ,menu b 
+  where a.SKU = b.SKU 
+
+-----------------------------Demand Distribution - Entrees-------------------------
+
+ select a.SKU,b.name,a.sale 
+       from (
+          select SKU,count(*) as sale 
+               from sales 
+               where sku >= 90000 and sku <= 90021 
+               group by SKU order by SKU asc) a 
+     ,menu b where a.SKU = b.SKU 
+     order by a.sale desc
+
+--------------------------------Demand Distribution - Drinks-----------------------
+
+
+ select a.SKU,b.name,a.sale 
+       from (
+          select SKU,count(*) as sale 
+               from sales 
+               where sku between 90022 and 90025 
+               group by SKU order by SKU asc) a 
+     ,menu b where a.SKU = b.SKU 
+     order by a.sale desc
+
+-------------------------------Demand Distribution - Sides---------------------------
+
+select a.SKU,b.name,a.sale 
+       from (
+          select SKU,count(*) as sale 
+               from sales 
+               where sku between 90026 and 90030 
+               group by SKU order by SKU asc) a 
+     ,menu b where a.SKU = b.SKU 
+     order by a.sale desc
+
+--------------------------------Create a Widget for Customizable Insights--------------------
+
+CREATE WIDGET DROPDOWN Product DEFAULT "Waffle Potato Fries" CHOICES select distinct name from menu
+
+-------------------------------Demand for Product Over Time-----------------------------
+
+select a.DATE,a.SKU,b.name,a.sale 
+  from (
+    select DATE,SKU,count(*) as sale 
+      from sales 
+      where menu_name = getArgument("Product") 
+      group by DATE,SKU 
+      order by DATE,SKU asc) a
+ ,menu b where a.SKU = b.SKU
+
+--------------------------------Generate a Temporary Derived Tables using CTAS----------------------
+
+create temporary view sales2 as 
+  select from_unixtime(timestamp,'YYYY-MM-dd HH') as `ts`, * from sales
+
+--------------------------------Weekly Product Demand ------------------------------------
+
+select a.ts,a.SKU,b.name,a.sale 
+  from (
+    select ts,SKU,count(*) as sale 
+      from sales2 
+      where menu_name = getArgument("Product") and DATE in ('2017-01-01', '2017-01-02', '2017-01-03', '2017-01-04', '2017-01-05','2017-01-06', '2017-01-07') 
+      group by ts,SKU order by ts,SKU asc) a 
+ ,menu b where a.SKU = b.SKU
+
+-----------------------------------Hourly Demand for Product-------------------------------------
+
+select ts, count(*) from sales2 
+  where menu_name = getArgument("Product")
+  and DATE = '2017-01-02'
+  group by ts order by ts asc
+
+-------------------------------Most Popular Locations----------------------------------------------
+
+select location_name, address, city, state, zipcode, count(*) from sales group by location_name, address, city, state, zipcode order by count(*) desc
+
+
+--------------------------------Model creation----------------------------------------------------------
+
+from pyspark.ml.classification import *
+from pyspark.ml.feature import *
+from pyspark.ml import Pipeline
+from pyspark.sql.functions import lit
+
+training = sales.sample(True, 0.01).withColumn('label', lit(1))
+
+----------------------------------Define the pipeline using transformers and a classifier----------------------
+
+tokenizer = Tokenizer(inputCol="menu_name", outputCol="menu_terms")
+hashingTF = HashingTF(inputCol=tokenizer.getOutputCol(), outputCol="features")
+lr = LogisticRegression(maxIter=10, regParam=0.001)
+pipeline = Pipeline(stages=[tokenizer, hashingTF, lr])
+
+----------------------------Train the model using the historical data---------------------------------
+
+model = pipeline.fit(training)
+
+-------------------------------Make predictions------------------------------------------------
+
+prediction = model.transform(training)
+
+--------------------------------Persist the trained model to disk for (real-time) scoring-----
+
+
+model.save("XXXXXXXXXXXXXXXXXXX")
+display(prediction.select("label", "menu_terms", "features", "prediction"))
+
+-------------------------------Load the streaming dataframe------------------------------------
+
+spark.conf.set("spark.sql.streaming.schemaInference", True)
+inputPathParquet = "/mnt/wesley/dataset/Fintech/demandforecast/streaming_sales"
+
+streamingSalesDF = ( 
+  spark
+    .readStream                      
+    .option("maxFilesPerTrigger", 1)  
+    .parquet(inputPathParquet)
+)
+
+streaming_training = streamingSalesDF.withColumn('label', lit(1))
+
+-----------------------------Make predictions using the model trained using the historical data--------------
+
+Make predictions using the model trained using the historical dataMake predictions using the model trained using the historical data
+
+display(streaming_predictions.select("label", "menu_terms", "features", "prediction"))
+
+---------------------------Results ------------------
+
+For the Entrees we can both in the batch as well as streaming data that the most popular item is Spicy chicken sandwich
+For the Sides we can both in the batch as well as streaming data that the most popular item is Waffle potato fries. This also happens to be the Most poular item on the menu.
+For the Drinks we can both in the batch as well as streaming data that the most popular item is Soft drinks. This also happens to be the Second Most poular item on the menu.
